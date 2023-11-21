@@ -13,6 +13,8 @@ use std::{
 use bitflags::bitflags;
 use rusb::{Context, Device, DeviceHandle, Hotplug, HotplugBuilder, Registration, UsbContext};
 
+use crate::metrics::{InputSnapshotMetric, Metrics, PollingMetric};
+
 #[repr(u8)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum ControllerKind {
@@ -341,6 +343,7 @@ pub struct GamecubeStick {
 
 #[derive(Debug, Copy, Clone)]
 pub struct GamecubeController {
+    pub rumble_enabled: bool,
     pub poll_count: usize,
     pub id: GamecubeId,
     pub kind: ControllerKind,
@@ -351,19 +354,26 @@ pub struct GamecubeController {
     pub right_trigger: TriggerAxis,
 }
 
+struct AdapterThreadCreationEvent {
+    pub adapter_id: AdapterId,
+    pub start_signal: oneshot::Sender<()>,
+    pub rumble_msg_sender: Sender<(GamecubeId, bool)>,
+}
+
 pub struct GamecubeControllers {
     connection_manager_thread: JoinHandle<()>,
     packet_receiver: Receiver<AdapterPacket>,
     disconnected_adapters: Receiver<AdapterId>,
-    waiting_threads: Receiver<oneshot::Sender<()>>,
+    waiting_threads: Receiver<AdapterThreadCreationEvent>,
     shutdown_signal: oneshot::Sender<()>,
-    _hotplug_handle: Option<Registration<Context>>,
-
+    snapshot_sender: Option<Sender<InputSnapshotMetric>>,
     adapters: Vec<(AdapterId, [Option<GamecubeController>; 4])>,
+    rumble_broadcasters: Vec<(AdapterId, Sender<(GamecubeId, bool)>)>,
+    _hotplug_handle: Option<Registration<Context>>,
 }
 
 impl GamecubeControllers {
-    pub fn new() -> Self {
+    pub fn new(metrics: Option<&Metrics>) -> Self {
         let context = Context::new().expect("failed to initialize rusb context");
 
         let (packet_tx, packet_rx) = mpsc::channel();
@@ -392,6 +402,9 @@ impl GamecubeControllers {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (disconnect_tx, disconnect_rx) = mpsc::channel();
 
+        let metrics_sender = metrics.map(|metrics| metrics.polling().new_sender());
+        let snapshot_sender = metrics.map(|metrics| metrics.input_snapshots().new_sender());
+
         let thread = std::thread::Builder::new()
             .name("GCAdapter Connection Manager Thread".to_string())
             .spawn(move || {
@@ -401,6 +414,7 @@ impl GamecubeControllers {
                     packet_tx,
                     disconnect_tx,
                     event_receiver,
+                    metrics_sender,
                     shutdown_rx,
                 )
             })
@@ -412,8 +426,10 @@ impl GamecubeControllers {
             disconnected_adapters: disconnect_rx,
             waiting_threads: waiting_rx,
             shutdown_signal: shutdown_tx,
-            _hotplug_handle: hp_handle,
+            snapshot_sender,
             adapters: vec![],
+            rumble_broadcasters: vec![],
+            _hotplug_handle: hp_handle,
         }
     }
 
@@ -421,8 +437,11 @@ impl GamecubeControllers {
         loop {
             match self.waiting_threads.try_recv() {
                 Ok(signal) => {
-                    if let Err(_error) = signal.send(()) {
+                    if let Err(_error) = signal.start_signal.send(()) {
                         log::error!("Failed to send start signal to thread while updating, thread must've already terminated");
+                    } else {
+                        self.rumble_broadcasters
+                            .push((signal.adapter_id, signal.rumble_msg_sender));
                     }
                 }
                 Err(TryRecvError::Disconnected) => {
@@ -485,6 +504,7 @@ impl GamecubeControllers {
                             continue;
                         }
 
+                        let rumble_enabled = (sub_packet[0] & 0x4) != 0;
                         let buttons = GamecubeButtons::from_bits_truncate(u16::from_le_bytes([
                             sub_packet[1],
                             sub_packet[2],
@@ -504,6 +524,7 @@ impl GamecubeControllers {
                         }
 
                         if let Some(controller) = adapter[x].as_mut() {
+                            controller.rumble_enabled = rumble_enabled;
                             controller.poll_count += 1;
                             controller.kind = kind;
                             controller.buttons |= buttons;
@@ -515,6 +536,7 @@ impl GamecubeControllers {
                             controller.right_trigger.set_value(r);
                         } else {
                             adapter[x] = Some(GamecubeController {
+                                rumble_enabled,
                                 poll_count: 1,
                                 id: GamecubeId {
                                     adapter_id: packet.adapter_id,
@@ -542,6 +564,12 @@ impl GamecubeControllers {
                 Err(TryRecvError::Empty) => break,
             }
         }
+
+        if let Some(sender) = self.snapshot_sender.as_ref() {
+            if let Err(_error) = sender.send(InputSnapshotMetric(Instant::now())) {
+                log::warn!("Failed to send input snapshot metric");
+            }
+        }
     }
 
     pub fn enumerate_connected_controllers<'a>(&'a self) -> impl Iterator<Item = GamecubeId> + 'a {
@@ -565,6 +593,23 @@ impl GamecubeControllers {
                 (*adapter_id == id.adapter_id).then_some(controllers[id.port as usize].as_ref())
             })
             .flatten()
+    }
+
+    pub fn set_rumble(&self, id: GamecubeId, enable: bool) {
+        if let Some((_, broadcaster)) = self
+            .rumble_broadcasters
+            .iter()
+            .find(|(adapter_id, _)| *adapter_id == id.adapter_id)
+        {
+            match broadcaster.send((id, enable)) {
+                Ok(_) => {}
+                Err(_error) => {
+                    log::warn!("Failed to broadcast rumble change for {id}");
+                }
+            }
+        } else {
+            log::warn!("Gamecube Controller {id}'s adapter was not found to signal a rumble event");
+        }
     }
 
     pub fn shutdown(self) {
@@ -691,7 +736,9 @@ fn rusb_adapter_management_thread(
     mut device: DeviceHandle<Context>,
     shutdown_signal: Weak<AtomicBool>,
     packet_sender: Sender<AdapterPacket>,
+    metrics_sender: Option<Sender<PollingMetric>>,
     start_thread_signal: oneshot::Receiver<()>,
+    rumble_msg_receiver: Receiver<(GamecubeId, bool)>,
 ) {
     const BLOCKING_DURATION: Duration = Duration::from_nanos(0);
 
@@ -739,6 +786,8 @@ fn rusb_adapter_management_thread(
         return;
     }
 
+    let mut rumble_state = [false; 4];
+
     let mut input_packet_buffer = [0u8; 37];
     while should_continue(&shutdown_signal) {
         log::trace!("rusb_adapter_management_thread({id}) preparing to poll");
@@ -752,6 +801,15 @@ fn rusb_adapter_management_thread(
                 if num_bytes != input_packet_buffer.len() {
                     log::error!("rusb_adapter_management_thread({id}) failed to read whole buffer (read {num_bytes} / {})", input_packet_buffer.len());
                     continue;
+                }
+
+                if let Some(metrics) = metrics_sender.as_ref() {
+                    if let Err(_error) = metrics.send(PollingMetric {
+                        id: id.to_string(),
+                        timestamp: Instant::now(),
+                    }) {
+                        log::warn!("rusb_adapter_management_thread({id}) to send polling metrics");
+                    }
                 }
 
                 log::trace!(
@@ -773,6 +831,57 @@ fn rusb_adapter_management_thread(
                 continue;
             }
         }
+
+        let mut rumble_msg = None;
+        loop {
+            match rumble_msg_receiver.try_recv() {
+                Ok((id, enable)) => {
+                    if rumble_msg.is_none() {
+                        rumble_msg = Some([None; 4]);
+                    }
+
+                    rumble_msg.as_mut().unwrap()[id.port as usize] = Some(enable);
+                }
+                Err(TryRecvError::Disconnected) => {
+                    log::error!(
+                        "rusb_adapter_management_thread({id}) rumble_msg_receiver is disconnected"
+                    );
+                    break;
+                }
+                Err(TryRecvError::Empty) => break,
+            }
+        }
+
+        if let Some(msg) = rumble_msg {
+            for idx in 0..4 {
+                rumble_state[idx] = msg[idx].unwrap_or(rumble_state[idx]);
+            }
+
+            let payload = [
+                0x11,
+                rumble_state[0] as u8,
+                rumble_state[1] as u8,
+                rumble_state[2] as u8,
+                rumble_state[3] as u8,
+            ];
+
+            match device.write_interrupt(
+                OEM_GAMECUBE_ADAPTER_WRITE,
+                &payload,
+                Duration::from_nanos(0),
+            ) {
+                Ok(num_bytes) => {
+                    if num_bytes != payload.len() {
+                        log::error!("rusb_adapter_management_thread({id}) failed to write whole rumble packet: {num_bytes} / {}", payload.len());
+                    }
+                }
+                Err(e) => {
+                    log::error!(
+                        "rusb_adapter_management_thread({id}) failed to write rumble packet: {e}"
+                    );
+                }
+            }
+        }
     }
 
     if has_kernel_driver {
@@ -788,10 +897,11 @@ fn rusb_adapter_management_thread(
 
 fn rusb_connection_manager(
     context: Context,
-    waiting_sender: Sender<oneshot::Sender<()>>,
+    waiting_sender: Sender<AdapterThreadCreationEvent>,
     packet_sender: Sender<AdapterPacket>,
     disconnect_sender: Sender<AdapterId>,
     receiver: Option<Receiver<GCAdapterConnectionEvent>>,
+    metrics_sender: Option<Sender<PollingMetric>>,
     shutdown_signal: oneshot::Receiver<()>,
 ) {
     const HANDLE_EVENTS_TIMEOUT: Duration = Duration::from_millis(500);
@@ -838,15 +948,26 @@ fn rusb_connection_manager(
                                 let (waiting_tx, waiting_rx) = oneshot::channel();
 
                                 let packet_sender = packet_sender.clone();
+                                let metrics_sender = metrics_sender.clone();
+
+                                let (rumble_msg_tx, rumble_msg_rx) = mpsc::channel();
+
+                                let event = AdapterThreadCreationEvent {
+                                    start_signal: waiting_tx,
+                                    adapter_id,
+                                    rumble_msg_sender: rumble_msg_tx,
+                                };
 
                                 let handle = std::thread::Builder::new()
                                     .name(format!("GCAdapter {adapter_id} Polling Thread"))
-                                    .spawn(move || rusb_adapter_management_thread(adapter_id, device, weak_signal, packet_sender, waiting_rx))
+                                    .spawn(move || rusb_adapter_management_thread(adapter_id, device, weak_signal, packet_sender, metrics_sender, waiting_rx, rumble_msg_rx))
                                     .unwrap_or_else(|_| panic!("Failed to spawn polling thread for GCAdapter {adapter_id}"));
 
-                                if let Err(e) = waiting_sender.send(waiting_tx) {
-                                    log::error!("rusb_connection_manager failed to hand off start signaler, starting thread immediately");
-                                    e.0.send(()).expect("failed to send start signal");
+                                if let Err(e) = waiting_sender.send(event) {
+                                    log::error!("rusb_connection_manager failed to hand off start signaler, starting thread immediately with no rumble support");
+                                    e.0.start_signal
+                                        .send(())
+                                        .expect("failed to send start signal");
                                 }
 
                                 adapter_threads.push((adapter_id, handle, shutdown_signal));
