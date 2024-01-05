@@ -35,6 +35,24 @@ impl From<u8> for ControllerKind {
     }
 }
 
+#[repr(usize)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum GamecubeButton {
+    A = 0,
+    B,
+    X,
+    Y,
+    DLeft,
+    DRight,
+    DDown,
+    DUp,
+    Start,
+    Z,
+    R,
+    L,
+}
+
 bitflags! {
     #[derive(Debug, Copy, Clone, PartialEq, Eq)]
     pub struct GamecubeButtons: u16 {
@@ -50,6 +68,12 @@ bitflags! {
         const Z = 1 << 9;
         const R = 1 << 10;
         const L = 1 << 11;
+    }
+}
+
+impl From<GamecubeButton> for GamecubeButtons {
+    fn from(value: GamecubeButton) -> Self {
+        Self::from_bits_truncate(1 << (value as u16))
     }
 }
 
@@ -591,6 +615,15 @@ impl GamecubeControllers {
             .iter()
             .find_map(|(adapter_id, controllers)| {
                 (*adapter_id == id.adapter_id).then_some(controllers[id.port as usize].as_ref())
+            })
+            .flatten()
+    }
+
+    pub fn get_controller_mut(&mut self, id: GamecubeId) -> Option<&mut GamecubeController> {
+        self.adapters
+            .iter_mut()
+            .find_map(|(adapter_id, controllers)| {
+                (*adapter_id == id.adapter_id).then_some(controllers[id.port as usize].as_mut())
             })
             .flatten()
     }

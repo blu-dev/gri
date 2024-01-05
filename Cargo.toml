@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 bitflags = "2"
 rusb = "0.9.3"
+serde = { version = "1", features = ["derive"], optional = true }
 uuid = { version = "1.5", features = ["v8"] }
 log = "0.4"
 oneshot = "0.1.6"
