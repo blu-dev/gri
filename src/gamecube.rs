@@ -1,5 +1,6 @@
 use std::{
     cmp::Ordering,
+    collections::HashMap,
     fmt::{Debug, Display},
     sync::{
         atomic::{AtomicBool, Ordering as AtomicOrdering},
@@ -941,6 +942,7 @@ fn rusb_connection_manager(
 
     let mut adapter_threads: Vec<(AdapterId, JoinHandle<()>, Arc<AtomicBool>)> = vec![];
     let mut join_list: Vec<(JoinHandle<()>, Arc<AtomicBool>)> = vec![];
+    let mut found_ids = HashMap::with_capacity(0x8);
 
     log::info!("rusb_connection_manager thread starting");
 
@@ -1032,33 +1034,121 @@ fn rusb_connection_manager(
                     }
                 }
             }
-            None => loop {
-                let devices = match context.devices() {
-                    Ok(devices) => devices,
-                    Err(e) => {
-                        log::error!("rusb_connection_manager failed to query for devices: {e}");
-                        break 'outer_loop;
-                    }
-                };
-
-                for device in devices.iter() {
-                    let desc = match device.device_descriptor() {
-                        Ok(desc) => desc,
+            None => {
+                loop {
+                    let devices = match context.devices() {
+                        Ok(devices) => devices,
                         Err(e) => {
-                            log::error!(
-                                "rusb_connection_manager failed to get device descriptor: {e}"
-                            );
-                            continue;
+                            log::error!("rusb_connection_manager failed to query for devices: {e}");
+                            break 'outer_loop;
                         }
                     };
 
-                    if desc.vendor_id() != OEM_GAMECUBE_ADAPTER_VID
-                        && desc.product_id() != OEM_GAMECUBE_ADAPTER_PID
-                    {
-                        continue;
+                    found_ids.clear();
+
+                    for device in devices.iter() {
+                        let desc = match device.device_descriptor() {
+                            Ok(desc) => desc,
+                            Err(e) => {
+                                log::error!(
+                                    "rusb_connection_manager failed to get device descriptor: {e}"
+                                );
+                                continue;
+                            }
+                        };
+
+                        if desc.vendor_id() != OEM_GAMECUBE_ADAPTER_VID
+                            && desc.product_id() != OEM_GAMECUBE_ADAPTER_PID
+                        {
+                            continue;
+                        }
+
+                        let id = AdapterId {
+                            bus: device.bus_number(),
+                            port_number: device.port_number(),
+                        };
+
+                        found_ids.insert(id, device);
+                    }
+
+                    let mut index = 0;
+                    while index < adapter_threads.len() {
+                        let thread_id = adapter_threads[index].0;
+                        if found_ids.remove(&thread_id).is_none() {
+                            let Some(position) = adapter_threads
+                                .iter()
+                                .position(|(id, _handle, _signal)| *id == thread_id)
+                            else {
+                                log::warn!("rusb_connection_manager received disconnection event for {thread_id}, but was not managing that device");
+                                continue;
+                            };
+
+                            let (id, handle, signal) = adapter_threads.remove(position);
+                            signal.store(true, AtomicOrdering::Release);
+
+                            if let Err(_error) = disconnect_sender.send(id) {
+                                log::error!("rusb_connection_manager failed to send disconnection event to handle");
+                            }
+
+                            join_list.push((handle, signal));
+                        } else {
+                            index += 1;
+                        }
+                    }
+
+                    for (adapter_id, device) in found_ids.iter() {
+                        let adapter_id = *adapter_id;
+                        let device = match device.open() {
+                            Ok(device) => device,
+                            Err(e) => {
+                                log::error!("rusb_connection_manager failed to open adapter {adapter_id}: {e}");
+                                continue;
+                            }
+                        };
+                        let shutdown_signal = Arc::new(AtomicBool::new(false));
+                        let weak_signal = Arc::downgrade(&shutdown_signal);
+
+                        let (waiting_tx, waiting_rx) = oneshot::channel();
+
+                        let packet_sender = packet_sender.clone();
+                        let metrics_sender = metrics_sender.clone();
+
+                        let (rumble_msg_tx, rumble_msg_rx) = mpsc::channel();
+
+                        let event = AdapterThreadCreationEvent {
+                            start_signal: waiting_tx,
+                            adapter_id,
+                            rumble_msg_sender: rumble_msg_tx,
+                        };
+
+                        let handle = std::thread::Builder::new()
+                            .name(format!("GCAdapter {adapter_id} Polling Thread"))
+                            .spawn(move || {
+                                rusb_adapter_management_thread(
+                                    adapter_id,
+                                    device,
+                                    weak_signal,
+                                    packet_sender,
+                                    metrics_sender,
+                                    waiting_rx,
+                                    rumble_msg_rx,
+                                )
+                            })
+                            .unwrap_or_else(|_| {
+                                panic!("Failed to spawn polling thread for GCAdapter {adapter_id}")
+                            });
+
+                        if let Err(e) = waiting_sender.send(event) {
+                            log::error!("rusb_connection_manager failed to hand off start signaler, starting thread immediately with no rumble support");
+                            e.0.start_signal
+                                .send(())
+                                .expect("failed to send start signal");
+                        }
+
+                        adapter_threads.push((adapter_id, handle, shutdown_signal));
                     }
                 }
-            },
+            }
         }
     }
 }
